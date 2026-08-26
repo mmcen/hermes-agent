@@ -70,25 +70,15 @@ jobs:
   # protected publish job after these tests pass.
   build:
     needs: [detect]
-    if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.build == 'true'
+    if: needs.detect.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest-32-core
-            platform: linux/amd64
-            cache-from: type=gha,scope=docker-amd64
-            cache-to: type=gha,mode=max,scope=docker-amd64
-          # arm64 builds on the native arm64 larger runner. A build of
-          # linux/arm64 on an x64 host uses emulation.
-          - arch: arm64
-            runner: ubuntu-latest-32-arm-core
-            platform: linux/arm64
-            cache-from: type=gha,scope=docker-arm64
-            cache-to: type=gha,mode=max,scope=docker-arm64
+        arch: [amd64]
 
-    runs-on: ${{ matrix.runner }}
+    # Fork: standard ubuntu-latest runner (no custom 32-core runners needed).
+    # arm64 build requires native arm runners; skip on forks.
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Checkout code
@@ -117,12 +107,12 @@ jobs:
           context: .
           file: Dockerfile
           load: true
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64
           tags: ${{ env.IMAGE_NAME }}:test
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
-          cache-from: ${{ matrix.cache-from }}
-          cache-to: ${{ (github.event_name != 'pull_request') && matrix.cache-to || '' }}
+          cache-from: type=gha,scope=docker-amd64
+          cache-to: ${{ (github.event_name != 'pull_request') && 'type=gha,mode=max,scope=docker-amd64' || '' }}
 
 
       # Run the docker-integration test suite against the freshly-built
