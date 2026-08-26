@@ -58,6 +58,16 @@ services:
       # - GOOGLE_CHAT_SUBSCRIPTION_NAME=${GOOGLE_CHAT_SUBSCRIPTION_NAME}
       # - GOOGLE_CHAT_SERVICE_ACCOUNT_JSON=${GOOGLE_CHAT_SERVICE_ACCOUNT_JSON}
       # - GOOGLE_CHAT_ALLOWED_USERS=${GOOGLE_CHAT_ALLOWED_USERS}
+      #
+      # SSH — enable SSH server inside the container (default port 2222).
+      # Provide your public key via SSH_PUBLIC_KEY. SSH_PORT is configurable.
+      # - SSH_ENABLED=true
+      # - SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY}
+      # - SSH_PORT=2222
+      #
+      # Cloudflare Tunnel — expose via Cloudflare Tunnel (cloudflared).
+      # Get a tunnel token from https://one.dash.cloudflare.com/ -> Networks -> Tunnels
+      # - TUNNEL_TOKEN=${TUNNEL_TOKEN}
     command: ["gateway", "run"]
 
   dashboard:

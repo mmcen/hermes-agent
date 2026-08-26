@@ -1,0 +1,16 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Cloudflared finish script — companion to ./run.
+# When TUNNEL_TOKEN is unset, ./run exits 0 and we exit 125
+# as s6 runs does not restart the service.
+
+case "${TUNNEL_TOKEN:-}" in
+    "")
+        # No token — permanent failure
+        exit 125
+        ;;
+    *)
+        # Token set — restart on crash
+        exit 0
+        ;;
+esac

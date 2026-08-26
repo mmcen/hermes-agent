@@ -1,0 +1,16 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# SSH finish script — companion to ./run.
+# When SSH_ENABLED is unset, ./run exits 0 and we exit 125
+# so s6-supervise does not restart the service in a tight loop.
+
+case "${SSH_ENABLED:-}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        # SSH was enabled — let s6-supervise restart it if it crashes
+        exit 0
+        ;;
+    *)
+        # SSH disabled — permanent failure
+        exit 125
+        ;;
+esac

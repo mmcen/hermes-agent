@@ -70,7 +70,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # hermes process, the dashboard, and per-profile gateways.
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client openssh-server docker-cli xz-utils sudo && \
     rm -rf /var/lib/apt/lists/*
 
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
@@ -134,6 +134,18 @@ RUN set -eu; \
     tar -C / -Jxpf /tmp/s6-overlay-symlinks-noarch.tar.xz; \
     rm /tmp/s6-overlay-*.tar.xz /tmp/s6-overlay.sha256
 
+# ---------- cloudflared install ----------
+# Cloudflare Tunnel client for exposing the container via Cloudflare Tunnel.
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) cf_arch="amd64" ;; \
+        arm64) cf_arch="arm64" ;; \
+        *) echo "Unsupported TARGETARCH=${TARGETARCH} for cloudflared" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 -o /usr/local/bin/cloudflared \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" && \
+    chmod 0755 /usr/local/bin/cloudflared
+
 # #34192 / #66679: backward-compat shim for orchestration templates that
 # still reference the legacy /usr/bin/tini entrypoint (Hostinger's
 # 'Hermes WebUI' catalog, NAS compose projects that preserve an old
@@ -148,6 +160,30 @@ COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
+
+# ---------- SSH server configuration ----------
+# Configure sshd for key-based auth only (no passwords).
+# Allow both root and hermes login.
+RUN mkdir -p /etc/ssh/sshd_config.d && \
+    { \
+        echo "PasswordAuthentication no"; \
+        echo "ChallengeResponseAuthentication no"; \
+        echo "PubkeyAuthentication yes"; \
+        echo "AuthorizedKeysFile .ssh/authorized_keys"; \
+        echo "PermitRootLogin yes"; \
+        echo "AllowUsers root hermes"; \
+        echo "LogLevel VERBOSE"; \
+    } > /etc/ssh/sshd_config.d/99-hermes.conf && \
+    mkdir -p /opt/data/.ssh && \
+    chmod 0700 /opt/data/.ssh && \
+    chown hermes:hermes /opt/data/.ssh
+
+# ---------- Sudo + root group for hermes ----------
+# Allow hermes to execute any command via sudo without password,
+# and add hermes to the root group for elevated access.
+RUN echo "hermes ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/hermes && \
+    chmod 0440 /etc/sudoers.d/hermes && \
+    usermod -aG root hermes
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 

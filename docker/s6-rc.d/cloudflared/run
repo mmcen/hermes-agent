@@ -1,0 +1,17 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Cloudflare Tunnel service (cloudflared).
+# Requires TUNNEL_TOKEN environment variable.
+
+set -e
+
+case "${TUNNEL_TOKEN:-}" in
+    "")
+        echo "[cloudflared] TUNNEL_TOKEN not set — service disabled" >&2
+        exit 0
+        ;;
+esac
+
+# Drop to hermes user if running as root
+[ "$(id -u)" = 0 ] && set -- s6-setuidgid hermes "$@"
+exec cloudflared tunnel --no-autoupdate --loglevel info run --token "${TUNNEL_TOKEN}"
