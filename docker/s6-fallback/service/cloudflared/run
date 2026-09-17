@@ -1,0 +1,18 @@
+#!/bin/sh
+# shellcheck shell=sh
+# Cloudflare Tunnel — supervised in the non-PID-1 fallback path.
+#
+# The platform owns PID 1 here, so s6-overlay's /init never runs and this
+# service is started by a plain s6-svscan tree assembled by
+# entrypoint-dispatch.sh. It reuses the stock s6-rc.d script, so the
+# TUNNEL_TOKEN guard and the root→hermes privilege drop behave exactly as they
+# do under s6-overlay.
+#
+# Output goes to a file because there is no s6-log service in this path
+# (`s6 logs cloudflared` reads it); the container log stream stays clean.
+. /opt/hermes/docker/s6-fallback/lib.sh
+
+LOG="$(log_dir)/cloudflared.log"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+
+exec sh /opt/hermes/docker/s6-rc.d/cloudflared/run >>"$LOG" 2>&1

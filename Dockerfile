@@ -455,6 +455,14 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
 
+# Non-PID-1 fallback support: the service definitions and helpers that
+# entrypoint-dispatch.sh assembles into an s6-svscan tree when the platform
+# owns PID 1 (Fly / Railway / CloudFoundry / --init), plus the `s6`
+# control & configuration menu available to operators in every layout.
+COPY --chmod=0755 docker/s6-fallback/service/ /opt/hermes/docker/s6-fallback/service/
+COPY --chmod=0644 docker/s6-fallback/lib.sh /opt/hermes/docker/s6-fallback/lib.sh
+COPY --chmod=0755 docker/s6-fallback/bin/s6 /usr/local/bin/s6
+
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported
 # the venv bin onto PATH; Architecture B's main-wrapper.sh does the
 # same for the container's main process, but `docker exec` and our

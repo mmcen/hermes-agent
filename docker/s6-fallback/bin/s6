@@ -1,0 +1,430 @@
+#!/bin/sh
+# shellcheck shell=sh
+# ===========================================================================
+#  s6 — service control & configuration menu for the Hermes Agent container
+#
+#  Works in both supervision layouts:
+#    * s6-overlay (image owns PID 1): live service dirs under /run/service
+#    * non-PID-1 fallback (Fly / Railway / CloudFoundry / --init): the tree
+#      entrypoint-dispatch.sh assembles under /run/hermes-s6/service
+#
+#  Quick reference:
+#    s6                     interactive menu (中文)
+#    s6 status              service overview
+#    s6 start   <svc|all>   start a service
+#    s6 stop    <svc|all>   stop a service (stays down)
+#    s6 restart <svc|all>   restart a service
+#    s6 logs    <svc> [-f]  tail a service log (-f to follow) [errors too]
+#    s6 conf                show effective configuration (secrets masked)
+#    s6 set     KEY=VALUE   add/update a setting in $HERMES_HOME/.env
+#    s6 unset   KEY         remove a setting
+#    s6 apply               apply config changes (restarts the gateway)
+#    s6 doctor              self-check (PID 1, services, perms, provider keys)
+#    s6 help                this text
+# ===========================================================================
+
+HERMES_HOME="${HERMES_HOME:-/opt/data}"
+LOGDIR="$HERMES_HOME/logs"
+ENVFILE="$HERMES_HOME/.env"
+# Side services the image can supervise; used for "absent" hints only —
+# `s6 status` lists whatever the scan directory actually holds.
+KNOWNSVC="gateway cloudflared dashboard sshd"
+
+detect_scandir() {
+    for d in "${S6_SCANDIR:-}" /run/hermes-s6/service /run/s6-anynines/service /run/service; do
+        [ -n "$d" ] && [ -d "$d" ] && { printf '%s' "$d"; return; }
+    done
+    printf '%s' "${S6_SCANDIR:-/run/service}"
+}
+SCANDIR="$(detect_scandir)"
+
+PATH="/command:/package/admin/s6/command:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export PATH
+
+die() { printf 's6: %s\n' "$*" >&2; exit 1; }
+hint() { printf '   → %s\n' "$*"; }
+
+# --- helpers ---------------------------------------------------------------
+
+mask() {
+    v="$1"
+    if [ -z "$v" ]; then printf '(unset)'; return; fi
+    n=${#v}
+    if [ "$n" -le 10 ]; then printf '********'; return; fi
+    printf '%s…%s (len=%s)' "$(printf '%s' "$v" | cut -c1-6)" \
+        "$(printf '%s' "$v" | cut -c$((n - 3))-$n)" "$n"
+}
+
+env_value() {
+    [ -f "$ENVFILE" ] || return 0
+    v="$(sed -n "s/^[[:space:]]*$1=//p" "$ENVFILE" 2>/dev/null | tail -n 1)"
+    case "$v" in
+        \"*\") v="${v#\"}"; v="${v%\"}" ;;
+        \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    esac
+    printf '%s' "$v"
+}
+
+enabled_services() {
+    [ -d "$SCANDIR" ] || return 0
+    for d in "$SCANDIR"/*; do
+        [ -d "$d" ] || continue
+        case "$(basename "$d")" in .*) continue ;; esac
+        basename "$d"
+    done
+}
+
+targets_of() {
+    if [ "$1" = "all" ]; then enabled_services; else printf '%s\n' "$1"; fi
+}
+
+svc_state() {
+    d="$SCANDIR/$1"
+    [ -d "$d" ] || { printf 'not supervised here'; return; }
+    s6-svstat "$d" 2>&1 | head -n 1
+}
+
+proc_owner() {
+    pid="$(s6-svstat -o pid "$SCANDIR/$1" 2>/dev/null)"
+    case "$pid" in ''|*[!0-9]*) printf -- '-'; return ;; esac
+    uid="$(awk '/^Uid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    [ -n "$uid" ] || { printf -- '-'; return; }
+    name="$(awk -F: -v u="$uid" '$3==u{print $1; exit}' /etc/passwd 2>/dev/null)"
+    printf '%s' "${name:-uid:$uid}"
+}
+
+is_up() { s6-svstat -u "$SCANDIR/$1" >/dev/null 2>&1; }
+
+run_mode_label() {
+    if [ -d "$SCANDIR/gateway" ]; then
+        case "$(proc_owner gateway)" in
+            root) printf 'root (explicit override, HERMES_ALLOW_ROOT_GATEWAY)' ;;
+            hermes) printf 'hermes (privilege drop via main-wrapper)' ;;
+            *) printf 'unknown (gateway not running)' ;;
+        esac
+        return
+    fi
+    printf 'gateway runs as the container main process (no gateway service)'
+}
+
+git_sha() {
+    cat "$HERMES_HOME/../hermes/.install_method" 2>/dev/null || true
+    command -v hermes >/dev/null 2>&1 && hermes --version 2>/dev/null | head -n 1
+}
+
+require_s6() {
+    command -v s6-svscan >/dev/null 2>&1 ||
+        die "s6 tools not found in PATH — is this the Hermes Agent image?"
+}
+
+svscan_pids() {
+    for p in /proc/[0-9]*; do
+        [ -r "$p/cmdline" ] || continue
+        case "$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)" in
+            *s6-svscan*) printf '%s ' "${p#/proc/}" ;;
+        esac
+    done
+}
+
+net_probe() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 getent hosts api.telegram.org >/dev/null 2>&1
+    else
+        getent hosts api.telegram.org >/dev/null 2>&1
+    fi
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_status() {
+    printf '\ns6 service status  (scandir=%s)\n' "$SCANDIR"
+    printf '──────────────────────────────────────────────────────────\n'
+    if [ ! -d "$SCANDIR" ]; then
+        printf '  (no scan directory — is the container running?)\n'
+        return
+    fi
+    printf '  %-12s %-6s %s\n' "service" "owner" "state"
+    any=0
+    for s in $(enabled_services); do
+        printf '  %-12s %-6s %s\n' "$s" "$(proc_owner "$s")" "$(svc_state "$s")"
+        any=1
+    done
+    [ "$any" = 0 ] && printf '  (nothing supervised)\n'
+    for s in $KNOWNSVC; do
+        [ -d "$SCANDIR/$s" ] || printf '  %-12s %-6s %s\n' "$s" "-" "not supervised (disabled or not a service here)"
+    done
+    printf '\n'
+    printf '  mode            %s\n' "$(run_mode_label)"
+    printf '  provider key    %s\n' \
+        "$(for k in NOUS_API_KEY OPENROUTER_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY; do
+              v="$(env_value "$k")"; [ -n "$v" ] && { printf '%s' "$k"; break; }; done)"
+    printf '  logs            %s   (s6 logs <service>)\n' "$LOGDIR"
+    if [ -d "$SCANDIR/gateway" ] && ! is_up gateway; then
+        printf '\n'
+        hint "gateway is NOT up — check: s6 logs gateway"
+        hint "crash history: tail $LOGDIR/gateway-crash.log"
+    fi
+}
+
+cmd_ctl() {
+    action="$1"; name="$2"
+    [ -n "$name" ] || die "usage: s6 $action <service|all>"
+    require_s6
+    [ -d "$SCANDIR" ] || die "scan directory $SCANDIR missing — nothing to control"
+    case "$action" in start|stop|restart) ;; *) die "bad action $action" ;; esac
+    for s in $(targets_of "$name"); do
+        d="$SCANDIR/$s"
+        if [ ! -d "$d" ]; then
+            printf 's6: %s not supervised here — skipped\n' "$s"
+            continue
+        fi
+        case "$action" in
+            start) s6-svc -u "$d" ;;
+            stop)  s6-svc -d "$d" ;;
+            restart)
+                if is_up "$s"; then s6-svc -t "$d"; else s6-svc -u "$d"; fi
+                ;;
+        esac
+        printf 's6: %s %s requested\n' "$s" "$action"
+    done
+    sleep 2
+    cmd_status
+}
+
+cmd_logs() {
+    svc="$1"; shift 2>/dev/null || true
+    follow=0; n=40
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--follow) follow=1 ;;
+            -n) shift; [ $# -gt 0 ] && n="$1" ;;
+            *[0-9]*) n="$1" ;;
+            *) die "usage: s6 logs <service> [-n N] [-f]" ;;
+        esac
+        shift
+    done
+    case "$svc" in
+        "") die "usage: s6 logs <gateway|cloudflared|dashboard|sshd|errors> [-n N] [-f]" ;;
+        *) f="$LOGDIR/$svc.log" ;;
+    esac
+    [ -f "$f" ] || die "no log file yet: $f"
+    if [ "$follow" = 1 ]; then
+        printf 's6: following %s (Ctrl-C to stop)\n' "$f"
+        exec tail -n "$n" -f "$f"
+    fi
+    tail -n "$n" "$f"
+}
+
+cmd_conf() {
+    printf '\ns6 configuration\n'
+    printf '──────────────────────────────────────────────────────────\n'
+    printf '  %-32s %s\n' "HERMES_HOME" "$HERMES_HOME"
+    printf '  %-32s %s\n' "run mode" "$(run_mode_label)"
+    printf '  %-32s %s\n' "data dir writable" "$([ -w "$HERMES_HOME" ] && echo yes || echo NO)"
+    printf '  %-32s %s\n' "config.yaml" "$([ -f "$HERMES_HOME/config.yaml" ] && echo "$HERMES_HOME/config.yaml" || echo '(none)')"
+    printf '  %-32s %s\n' ".env" "$([ -f "$ENVFILE" ] && echo "$ENVFILE" || echo '(none)')"
+    printf '\n  Platform env (secrets masked)\n'
+    for k in HERMES_DASHBOARD HERMES_DASHBOARD_HOST HERMES_DASHBOARD_BASIC_AUTH_USERNAME \
+             SSH_ENABLED SSH_PORT TELEGRAM_ALLOWED_USERS TELEGRAM_HOME_CHANNEL; do
+        eval "v=\${$k:-}"
+        printf '    %-38s %s\n' "$k" "${v:-(unset)}"
+    done
+    for k in HERMES_DASHBOARD_BASIC_AUTH_PASSWORD HERMES_DASHBOARD_BASIC_AUTH_SECRET \
+             TUNNEL_TOKEN TELEGRAM_BOT_TOKEN; do
+        eval "v=\${$k:-}"
+        printf '    %-38s %s\n' "$k" "$(mask "$v")"
+    done
+    printf '\n  Provider keys in %s (masked)\n' "$ENVFILE"
+    found=0
+    for k in NOUS_API_KEY OPENROUTER_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY; do
+        v="$(env_value "$k")"
+        if [ -n "$v" ]; then printf '    %-38s %s\n' "$k" "$(mask "$v")"; found=1; fi
+    done
+    [ "$found" = 0 ] && printf '    (none set — the gateway needs at least one inference provider key)\n'
+    printf '\n'
+    hint "set one with: s6 set NOUS_API_KEY=xxxx   then: s6 apply"
+}
+
+cmd_set() {
+    kv="$1"
+    [ -n "$kv" ] || die "usage: s6 set KEY=VALUE"
+    case "$kv" in *=*) ;; *) die "usage: s6 set KEY=VALUE" ;; esac
+    key="${kv%%=*}"; val="${kv#*=}"
+    case "$key" in
+        [A-Za-z_]*) ;;
+        *) die "invalid key '$key'" ;;
+    esac
+    case "$key" in
+        *[!A-Za-z0-9_]*) die "invalid key '$key' (letters, digits, underscore only)" ;;
+    esac
+    mkdir -p "$(dirname "$ENVFILE")" 2>/dev/null || true
+    touch "$ENVFILE" 2>/dev/null || die "cannot write $ENVFILE"
+    tmp="$ENVFILE.s6.$$"
+    grep -v "^[[:space:]]*$key=" "$ENVFILE" >"$tmp" 2>/dev/null || true
+    printf '%s=%s\n' "$key" "$val" >>"$tmp"
+    # Follow the data dir's owner (hermes on /opt/data, root when the gateway
+    # runs as root) instead of hardcoding a user.
+    chown --reference="$HERMES_HOME" "$tmp" 2>/dev/null || true
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$ENVFILE"
+    chown --reference="$HERMES_HOME" "$ENVFILE" 2>/dev/null || true
+    printf 's6: %s saved to %s\n' "$key" "$ENVFILE"
+    hint "apply with: s6 apply    (restarts the gateway)"
+}
+
+cmd_unset() {
+    key="$1"
+    [ -n "$key" ] || die "usage: s6 unset KEY"
+    [ -f "$ENVFILE" ] || die "no $ENVFILE"
+    tmp="$ENVFILE.s6.$$"
+    grep -v "^[[:space:]]*$key=" "$ENVFILE" >"$tmp" 2>/dev/null || true
+    chown --reference="$HERMES_HOME" "$tmp" 2>/dev/null || true
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$ENVFILE"
+    printf 's6: %s removed from %s\n' "$key" "$ENVFILE"
+    hint "apply with: s6 apply"
+}
+
+cmd_apply() {
+    require_s6
+    printf 's6: applying configuration — restarting the gateway...\n'
+    if [ -d "$SCANDIR/gateway" ]; then
+        if is_up gateway; then s6-svc -t "$SCANDIR/gateway"; else s6-svc -u "$SCANDIR/gateway"; fi
+    else
+        # No gateway service in this layout (the gateway is the container's
+        # main process): let the hermes CLI do the restart.
+        command -v hermes >/dev/null 2>&1 || die "neither a gateway service nor the hermes CLI is available"
+        hermes gateway restart || die "hermes gateway restart failed"
+    fi
+    sleep 4
+    cmd_status
+    printf '\n  recent gateway log:\n'
+    tail -n 12 "$LOGDIR/gateway.log" 2>/dev/null | sed 's/^/    /' || true
+}
+
+cmd_doctor() {
+    printf '\ns6 doctor\n'
+    printf '──────────────────────────────────────────────────────────\n'
+    p1="$(tr '\0' ' ' </proc/1/cmdline 2>/dev/null)"
+    printf '  %-26s %s\n' "PID 1" "${p1:-unknown}"
+    printf '  %-26s %s\n' "s6-svscan" "$(command -v s6-svscan 2>/dev/null || echo MISSING)"
+    printf '  %-26s %s\n' "svscan running" "$(pids="$(svscan_pids)"; [ -n "$pids" ] && echo "yes (pid ${pids% })" || echo NO)"
+    printf '  %-26s %s\n' "scandir" "$SCANDIR"
+    printf '  %-26s %s\n' "supervised" "$(enabled_services | tr '\n' ' ')"
+    printf '\n'
+    printf '  %-12s %-6s %s\n' "service" "owner" "state"
+    for s in $(enabled_services); do
+        printf '  %-12s %-6s %s\n' "$s" "$(proc_owner "$s")" "$(svc_state "$s")"
+    done
+    printf '\n'
+    printf '  %-26s %s\n' "HERMES_HOME" "$HERMES_HOME"
+    printf '  %-26s %s\n' "HERMES_HOME writable" "$([ -w "$HERMES_HOME" ] && echo yes || echo NO)"
+    printf '  %-26s %s\n' "net egress" "$(net_probe && echo ok || echo 'check failed')"
+    df -h "$HERMES_HOME" 2>/dev/null | tail -n 1 | awk '{printf "  %-26s %s used of %s (%s)\n", "disk", $3, $2, $5}'
+    free -m 2>/dev/null | awk '/Mem:/ {printf "  %-26s %s MB used of %s MB\n", "memory", $3, $2}'
+    printf '\n  provider keys\n'
+    found=0
+    for k in NOUS_API_KEY OPENROUTER_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY; do
+        [ -n "$(env_value "$k")" ] && { printf '    %-28s %s\n' "$k" "set"; found=1; }
+    done
+    [ "$found" = 0 ] && printf '    %s\n' "NONE — the gateway cannot call a model (s6 set NOUS_API_KEY=...)"
+    if [ -f "$LOGDIR/gateway-crash.log" ]; then
+        printf '\n  recent gateway crashes\n'
+        tail -n 5 "$LOGDIR/gateway-crash.log" | sed 's/^/    /'
+    fi
+    printf '\n'
+}
+
+cmd_help() {
+    cat <<'EOF'
+s6 — service control & configuration menu (Hermes Agent image)
+
+  s6                       interactive menu (中文)
+  s6 status                service overview
+  s6 start   <svc|all>     start a service   (svc: cloudflared|dashboard|sshd|gateway)
+  s6 stop    <svc|all>     stop a service (stays down until started again)
+  s6 restart <svc|all>     restart a service
+  s6 logs    <svc> [-n N] [-f]
+                           tail a service log; also: errors, gateway-crash
+  s6 conf                  effective configuration (secrets masked)
+  s6 set     KEY=VALUE     add/update a setting in $HERMES_HOME/.env
+  s6 unset   KEY           remove a setting
+  s6 apply                 apply config (restarts the gateway)
+  s6 doctor                self-check: PID 1, services, perms, provider keys, disk
+  s6 help                  this text
+
+Notes
+  • Two layouts are supported: s6-overlay (image owns PID 1, service dirs under
+    /run/service) and the non-PID-1 fallback tree (/run/hermes-s6/service)
+    that entrypoint-dispatch.sh assembles for Fly / Railway / CloudFoundry.
+  • Supervised services restart automatically on crash (~1/s max).
+    `s6 stop` marks one wanted-down so it stays stopped.
+  • Image updates are not done from inside the container: pull/build a new
+    image tag and recreate the container.
+  • Config lives in $HERMES_HOME/.env; on platforms without a persistent volume
+    that directory is cleared whenever the container is recreated.
+EOF
+}
+
+menu_pick_service() {
+    printf '服务 (cloudflared/dashboard/sshd/gateway/all): '
+    read -r svc || return
+    [ -n "$svc" ] || return
+    cmd_ctl "$1" "$svc"
+}
+
+cmd_menu() {
+    while :; do
+        cat <<'EOF'
+
+  ┌─ s6 管理菜单 · Hermes Agent ───────────────────────────────┐
+  │  1) 状态总览                status                        │
+  │  2) 启动服务                start <svc|all>               │
+  │  3) 停止服务                stop <svc|all>                │
+  │  4) 重启服务                restart <svc|all>             │
+  │  5) 查看日志                logs <svc> [-f]               │
+  │  6) 查看配置 (脱敏)         conf                          │
+  │  7) 添加/修改配置           set KEY=VALUE                 │
+  │  8) 应用配置 (重启 gateway) apply                         │
+  │  9) 体检                    doctor                        │
+  │  h) 帮助                    help                          │
+  │  0) 退出                                                  │
+  └───────────────────────────────────────────────────────────┘
+EOF
+        printf '选择 [0-9/h]: '
+        read -r choice || break
+        case "$choice" in
+            1) cmd_status ;;
+            2) menu_pick_service start ;;
+            3) menu_pick_service stop ;;
+            4) menu_pick_service restart ;;
+            5) printf '服务: '; read -r s; [ -n "$s" ] && cmd_logs "$s" ;;
+            6) cmd_conf ;;
+            7) printf 'KEY=VALUE: '; read -r kv; [ -n "$kv" ] && cmd_set "$kv" ;;
+            8) cmd_apply ;;
+            9) cmd_doctor ;;
+            h|H|help) cmd_help ;;
+            0|q|Q|exit) break ;;
+            '') ;;
+            *) printf '无效选择: %s\n' "$choice" ;;
+        esac
+    done
+}
+
+# --- dispatch --------------------------------------------------------------
+
+case "${1:-}" in
+    ""|menu|m)              cmd_menu ;;
+    status|st|s)            cmd_status ;;
+    start)                  cmd_ctl start "${2:-}" ;;
+    stop)                   cmd_ctl stop "${2:-}" ;;
+    restart|reload)         cmd_ctl restart "${2:-}" ;;
+    logs|log|l)             shift; cmd_logs "$@" ;;
+    conf|config|show)       cmd_conf ;;
+    set|add)                cmd_set "${2:-}" ;;
+    unset|del|rm)           cmd_unset "${2:-}" ;;
+    apply|update|up)        cmd_apply ;;
+    doctor|check|health)    cmd_doctor ;;
+    help|-h|--help)         cmd_help ;;
+    *)                      cmd_help; exit 1 ;;
+esac

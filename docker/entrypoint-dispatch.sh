@@ -9,10 +9,16 @@
 # Wrapped-runtime path (Fly Machines, `docker run --init`, Railway,
 # CloudFoundry/diego, some Nomad/K8s setups): the platform's own init is
 # already PID 1 and execs the image entrypoint as a child. s6-overlay
-# aborts there with "can only run as pid 1", so we run the stage2
-# bootstrap directly, manually background the side services
-# (cloudflared / sshd) that s6 would otherwise supervise, and then exec
-# the main wrapper without /init.
+# aborts there with "can only run as pid 1", so we run the stage2 bootstrap
+# ourselves, assemble a small s6 scan directory from
+# /opt/hermes/docker/s6-fallback/service and run `s6-svscan` as a child to
+# supervise the side services (cloudflared / dashboard / sshd). A crashed
+# service is then restarted in place instead of silently disappearing, and
+# `s6` (see /usr/local/bin/s6) can drive them by hand.
+#
+# The container's main program stays the user's CMD, run through
+# main-wrapper.sh as before — the container still exits when that command
+# exits (Architecture B).
 
 set -e
 
@@ -20,43 +26,61 @@ if [ "$$" -eq 1 ]; then
     exec /init /opt/hermes/docker/main-wrapper.sh "$@"
 fi
 
-echo "[hermes] WARNING: container entrypoint is not PID 1; skipping s6-overlay /init and falling back to direct bootstrap + manual side-service startup." >&2
+echo "[hermes] WARNING: container entrypoint is not PID 1; skipping s6-overlay /init and falling back to direct bootstrap + s6-supervised side services." >&2
 # /init normally seeds PATH with s6's helpers; the non-PID-1 fallback skips it.
 export PATH="/command:/package/admin/s6/command:${PATH}"
 /opt/hermes/docker/stage2-hook.sh
 
-mkdir -p /opt/data/logs
-chown -R hermes:hermes /opt/data 2>/dev/null || true
+DATA="${HERMES_HOME:-/opt/data}"
+mkdir -p "$DATA/logs"
+chown -R hermes:hermes "$DATA" 2>/dev/null || true
 
-# --- cloudflared (manual, no s6 supervision available) ---
-# The s6-rc.d/cloudflared/run script reads TUNNEL_TOKEN from the
-# environment; in this fallback path the container env is intact, so we
-# can hand it straight to `sh` (ignoring the with-contenv shebang).
+# --- assemble the supervised scan directory ---------------------------------
+# Service definitions live in docker/s6-fallback/service; each one delegates to
+# the matching s6-rc.d/run script, so behaviour (token guard, HERMES_DASHBOARD
+# gate, authorized_keys seeding, privilege drops) matches the s6-overlay path.
+SCANDIR=/run/hermes-s6/service
+SRC=/opt/hermes/docker/s6-fallback/service
+
+enable() {
+    s="$1"
+    [ -d "$SRC/$s" ] || { echo "[hermes] service definition missing: $s" >&2; return 0; }
+    cp -R "$SRC/$s" "$SCANDIR/$s"
+    chmod 0755 "$SCANDIR/$s" 2>/dev/null || true
+    chmod 0755 "$SCANDIR/$s/run" 2>/dev/null || true
+    [ -f "$SCANDIR/$s/finish" ] && chmod 0755 "$SCANDIR/$s/finish" 2>/dev/null || true
+    return 0
+}
+
+rm -rf "$SCANDIR"
+mkdir -p "$SCANDIR"
+
 if [ -n "${TUNNEL_TOKEN:-}" ]; then
-    (
-        cd /opt/data || exit 1
-        nohup sh /opt/hermes/docker/s6-rc.d/cloudflared/run \
-            > /opt/data/logs/cloudflared.log 2>&1 &
-    )
-    echo "[hermes] cloudflared launched (TUNNEL_TOKEN set)" >&2
+    enable cloudflared
 else
-    echo "[hermes] TUNNEL_TOKEN unset, cloudflared skipped" >&2
+    echo "[hermes] TUNNEL_TOKEN unset — cloudflared not supervised" >&2
 fi
 
-# --- sshd (manual, no s6 supervision available) ---
+case "${HERMES_DASHBOARD:-}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        enable dashboard ;;
+    *)
+        echo "[hermes] HERMES_DASHBOARD off — dashboard not supervised" >&2 ;;
+esac
+
 case "${SSH_ENABLED:-}" in
     1|true|TRUE|True|yes|YES|Yes)
         export SSH_PORT="${SSH_PORT:-2222}"
-        (
-            cd /opt/data || exit 1
-            nohup sh /opt/hermes/docker/s6-rc.d/sshd/run \
-                > /opt/data/logs/sshd.log 2>&1 &
-        )
-        echo "[hermes] sshd launched on ${SSH_PORT}" >&2
-        ;;
+        enable sshd ;;
     *)
-        echo "[hermes] SSH_ENABLED unset/false, sshd skipped" >&2
-        ;;
+        echo "[hermes] SSH_ENABLED unset/false — sshd not supervised" >&2 ;;
 esac
+
+if [ -n "$(ls -A "$SCANDIR" 2>/dev/null)" ]; then
+    s6-svscan "$SCANDIR" &
+    echo "[hermes] s6-svscan supervising:$(for d in "$SCANDIR"/*; do [ -d "$d" ] && printf ' %s' "$(basename "$d")"; done)" >&2
+else
+    echo "[hermes] no side services enabled — nothing to supervise" >&2
+fi
 
 exec /opt/hermes/docker/main-wrapper.sh "$@"

@@ -1,0 +1,17 @@
+#!/bin/sh
+# shellcheck shell=sh
+# Hermes Web UI (dashboard) — supervised in the non-PID-1 fallback path.
+#
+# Reuses the stock s6-rc.d script: HERMES_DASHBOARD gate, HOME reset, venv
+# activation, auth-provider checks and the root→hermes privilege drop all
+# behave as under s6-overlay. entrypoint-dispatch.sh only places this service
+# in the scan directory when HERMES_DASHBOARD is truthy, so the disabled case
+# never needs the stock finish-script dance.
+#
+# Output goes to a file (`s6 logs dashboard`).
+. /opt/hermes/docker/s6-fallback/lib.sh
+
+LOG="$(log_dir)/dashboard.log"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+
+exec sh /opt/hermes/docker/s6-rc.d/dashboard/run >>"$LOG" 2>&1
